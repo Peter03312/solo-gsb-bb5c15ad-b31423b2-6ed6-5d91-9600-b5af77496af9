@@ -214,11 +214,40 @@ body {
   border-radius: 8px;
   padding: 14px 18px;
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   align-items: center;
 }
 .publish-bar > div:first-child { flex: 1; font-size: 13px; color: var(--primary-dark); }
 .publish-bar input { width: 240px; margin: 0; }
+.publish-bar #schedule-box { flex-basis: 100%; border-top: 1px dashed var(--line); padding-top: 10px; }
+.schedule-form { font-size: 13px; color: var(--primary-dark); }
+.schedule-form summary { cursor: pointer; font-weight: 600; }
+.schedule-form input, .schedule-form select { margin: 4px 0; padding: 6px 8px; }
+.schedule-form #sch-note { width: 100%; box-sizing: border-box; }
+
+/* ---------- 预约发布信息条 ---------- */
+.schedule-banner {
+  margin-top: 12px;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.schedule-banner.pending {
+  background: var(--adopt-bg);
+  border: 1px solid var(--adopt-border);
+  color: var(--primary-dark);
+}
+.schedule-banner.invalid {
+  background: var(--conflict-bg);
+  border: 1px solid var(--conflict-border);
+  color: var(--danger);
+}
 
 /* ---------- 侧栏标签 ---------- */
 .tabs { display: flex; border-bottom: 1px solid var(--line); }

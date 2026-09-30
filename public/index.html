@@ -69,11 +69,15 @@
 
         <div id="paper" class="paper"></div>
 
+        <!-- 预约发布信息条（任何登录用户可见；复核员可在此取消/新建） -->
+        <div id="schedule-banner" class="schedule-banner hidden"></div>
+
         <!-- 发布条 -->
         <div id="publish-bar" class="publish-bar hidden">
           <div id="stage-summary"></div>
           <input id="publish-note" placeholder="版本说明（可选），如：第一次修订发布" />
           <button class="btn primary" id="publish-btn">发布新版本</button>
+          <div id="schedule-box"></div>
         </div>
       </section>
 

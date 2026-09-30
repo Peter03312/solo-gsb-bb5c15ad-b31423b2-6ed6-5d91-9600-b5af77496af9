@@ -71,6 +71,21 @@ function addDecision(db, { type, proposalId = null, versionId = null, actorId, r
   ).run(type, proposalId, versionId, actorId, reason, JSON.stringify(detail));
 }
 
+// 立即取写锁（BEGIN IMMEDIATE）执行 fn：人工发布与预约到点执行并发时二者串行化，
+// 配合 busy_timeout 与预约行条件领取，保证至多生成一个新版本。fn 内不得再开 db.transaction
+// （本函数用于最外层事务；内部复用的提交逻辑本身不开事务）。
+function runInImmediateTx(db, fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (e) {
+    if (db.inTransaction) db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
 // ---------- 导入 ----------
 function importTranscript(db, actor, title, text) {
   if (getDoc(db)) throw conflict('逐字稿已导入并已发布初始版本，不能重复导入', 'ALREADY_INITIALIZED');
@@ -240,6 +255,8 @@ function previewSegments(segments, stage) {
 }
 
 // ---------- 发布 ----------
+// 人工发布：执行发布事务，并在同一事务内使待执行预约失效（版本已被人工发布推进，
+// 预约快照不再可能一致）。到点自动发布走 executeDueSchedules，共用同一发布事务。
 function publish(db, actor, note) {
   const cur = latestVersion(db);
   if (!cur) throw conflict('尚未导入逐字稿，无可发布内容', 'NO_DOCUMENT');
@@ -248,84 +265,96 @@ function publish(db, actor, note) {
     throw conflict('重复发布被拒绝：暂存区中没有已采纳修订，发布必须包含修订并形成新版本', 'EMPTY_PUBLISH');
   }
   const segments = segmentsOf(cur);
-
-  return db.transaction(() => {
-    // 0) 发布闸门：被暂存修订触及的异议必须已逐条回应；回应缺失或已失效（提议被驳回、
-    //    异议被重新定位等导致绑定不再匹配）时拒绝发布，版本/提议/决议均不改变。
-    const touched = assertObjectionsResolved(db, cur, stage);
-
-    // 1) 合版：同一基版上互不重叠的采纳结果按段合并
-    const newSegments = previewSegments(segments, stage);
-
-    const vr = db.prepare(
-      'INSERT INTO versions (note, segments_json, created_by, decision_watermark) VALUES (?,?,?,0)'
-    ).run((note || '').trim() || '发布修订', JSON.stringify(newSegments), actor.id);
-    const newId = vr.lastInsertRowid;
-
-    // 2) 已采纳提议落版
-    const markPublished = db.prepare(
-      `UPDATE proposals SET status='published', published_version_id=? WHERE id=?`
-    );
-    for (const p of stage) {
-      markPublished.run(newId, p.id);
-      addDecision(db, {
-        type: 'publish',
-        proposalId: p.id,
-        versionId: newId,
-        actorId: actor.id,
-        reason: `随 v${newId} 发布`,
-        detail: { seg: p.seg, start: p.start_cp, end: p.end_cp },
-      });
-    }
-
-    // 3) 新版本形成后，所有仍待复核的提议基版均已过期 → 标记冲突
-    //    （不能悄悄失效，也不能覆盖新修订；须由记录员基于新版本重新提交）
-    const stale = db.prepare(`SELECT * FROM proposals WHERE status='pending'`).all();
-    for (const p of stale) {
-      const reason = `基版已过期：提议提交时绑定 v${p.base_version_id}，发布后当前版本为 v${newId}；请基于新版本重新提交`;
-      db.prepare(`UPDATE proposals SET status='conflicted', conflict_reason=?, conflict_kind='base_expired' WHERE id=?`).run(reason, p.id);
-      addDecision(db, { type: 'conflict', proposalId: p.id, versionId: newId, actorId: null, reason });
-    }
-
-    // 4) 异议锚点映射：相交即需重新定位，保留原文快照
-    mapObjectionAnchors(db, newId, stage);
-
-    // 4.5) 回应固化：通过闸门的回应草稿绑定到本次发布版本，在该历史版本只读展示
-    const publishDraft = db.prepare(
-      `UPDATE objection_responses SET status='published', published_version_id=?
-       WHERE objection_id=? AND status='draft' AND version_id=?`
-    );
-    for (const objectionId of touched.keys()) {
-      const dr = publishDraft.run(newId, objectionId, cur.id);
-      if (dr.changes === 0) continue; // 闸门已保证存在有效草稿；防御性跳过
-      const resp = db
-        .prepare('SELECT * FROM objection_responses WHERE objection_id=? AND published_version_id=?')
-        .get(objectionId, newId);
-      const info = touched.get(objectionId);
-      addDecision(db, {
-        type: 'objection_respond',
-        proposalId: null,
-        versionId: newId,
-        actorId: actor.id,
-        reason: `发布前对被触及异议 #${objectionId} 的回应`,
-        detail: {
-          responseId: resp.id,
-          objectionId,
-          touchedProposalIds: info.proposals,
-          note: resp.note,
-        },
-      });
-      db.prepare(
-        `INSERT INTO objection_logs (objection_id, actor_id, action, detail_json) VALUES (?,?, 'response_published', ?)`
-      ).run(objectionId, actor.id, JSON.stringify({ responseId: resp.id, version: newId }));
-    }
-
-    // 5) 决议水位线：包含本次发布产生的全部决议
-    const watermark = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM decisions').get().m;
-    db.prepare('UPDATE versions SET decision_watermark=? WHERE id=?').run(watermark, newId);
-
+  return runInImmediateTx(db, () => {
+    const newId = commitPublish(db, actor, note, cur, stage, segments);
+    invalidatePendingSchedules(db, {
+      reason: `人工发布已生成 v${newId}：预约时的当前版本为 v${cur.id}，版本已变化，预约自动失效`,
+      tx: true,
+    });
+    finishWatermark(db, newId);
     return newId;
-  })();
+  });
+}
+
+// 发布事务主体（调用方须已在事务内）：异议闸门 → 合版 → 落版提议 → 过期冲突 →
+// 异议锚点映射 → 回应固化；决议水位线最后由调用方在补充决议后更新（见 finishWatermark）。
+function commitPublish(db, actor, note, cur, stage, segments) {
+  // 0) 发布闸门：被暂存修订触及的异议必须已逐条回应；回应缺失或已失效（提议被驳回、
+  //    异议被重新定位等导致绑定不再匹配）时拒绝发布，版本/提议/决议均不改变。
+  const touched = assertObjectionsResolved(db, cur, stage);
+
+  // 1) 合版：同一基版上互不重叠的采纳结果按段合并
+  const newSegments = previewSegments(segments, stage);
+
+  const vr = db.prepare(
+    'INSERT INTO versions (note, segments_json, created_by, decision_watermark) VALUES (?,?,?,0)'
+  ).run((note || '').trim() || '发布修订', JSON.stringify(newSegments), actor.id);
+  const newId = vr.lastInsertRowid;
+
+  // 2) 已采纳提议落版
+  const markPublished = db.prepare(
+    `UPDATE proposals SET status='published', published_version_id=? WHERE id=?`
+  );
+  for (const p of stage) {
+    markPublished.run(newId, p.id);
+    addDecision(db, {
+      type: 'publish',
+      proposalId: p.id,
+      versionId: newId,
+      actorId: actor.id,
+      reason: `随 v${newId} 发布`,
+      detail: { seg: p.seg, start: p.start_cp, end: p.end_cp },
+    });
+  }
+
+  // 3) 新版本形成后，所有仍待复核的提议基版均已过期 → 标记冲突
+  //    （不能悄悄失效，也不能覆盖新修订；须由记录员基于新版本重新提交）
+  const stale = db.prepare(`SELECT * FROM proposals WHERE status='pending'`).all();
+  for (const p of stale) {
+    const reason = `基版已过期：提议提交时绑定 v${p.base_version_id}，发布后当前版本为 v${newId}；请基于新版本重新提交`;
+    db.prepare(`UPDATE proposals SET status='conflicted', conflict_reason=?, conflict_kind='base_expired' WHERE id=?`).run(reason, p.id);
+    addDecision(db, { type: 'conflict', proposalId: p.id, versionId: newId, actorId: null, reason });
+  }
+
+  // 4) 异议锚点映射：相交即需重新定位，保留原文快照
+  mapObjectionAnchors(db, newId, stage);
+
+  // 4.5) 回应固化：通过闸门的回应草稿绑定到本次发布版本，在该历史版本只读展示
+  const publishDraft = db.prepare(
+    `UPDATE objection_responses SET status='published', published_version_id=?
+     WHERE objection_id=? AND status='draft' AND version_id=?`
+  );
+  for (const objectionId of touched.keys()) {
+    const dr = publishDraft.run(newId, objectionId, cur.id);
+    if (dr.changes === 0) continue; // 闸门已保证存在有效草稿；防御性跳过
+    const resp = db
+      .prepare('SELECT * FROM objection_responses WHERE objection_id=? AND published_version_id=?')
+      .get(objectionId, newId);
+    const info = touched.get(objectionId);
+    addDecision(db, {
+      type: 'objection_respond',
+      proposalId: null,
+      versionId: newId,
+      actorId: actor.id,
+      reason: `发布前对被触及异议 #${objectionId} 的回应`,
+      detail: {
+        responseId: resp.id,
+        objectionId,
+        touchedProposalIds: info.proposals,
+        note: resp.note,
+      },
+    });
+    db.prepare(
+      `INSERT INTO objection_logs (objection_id, actor_id, action, detail_json) VALUES (?,?, 'response_published', ?)`
+    ).run(objectionId, actor.id, JSON.stringify({ responseId: resp.id, version: newId }));
+  }
+  return newId;
+}
+
+// 决议水位线：版本可见 id <= watermark 的全部决议（调用方须在事务内、决议写完后调用）
+function finishWatermark(db, versionId) {
+  const watermark = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM decisions').get().m;
+  db.prepare('UPDATE versions SET decision_watermark=? WHERE id=?').run(watermark, versionId);
 }
 
 function editsBySegment(stage) {
@@ -849,11 +878,13 @@ function respondToObjection(db, actor, id, body) {
       db.prepare(
         `UPDATE objection_responses
          SET note=?, touched_proposal_ids_json=?, stage_fingerprint=?,
-             anchor_seg=?, anchor_start_cp=?, anchor_end_cp=?, responded_by=?, updated_at=datetime('now')
+             anchor_seg=?, anchor_start_cp=?, anchor_end_cp=?, responded_by=?,
+             version_id=?, updated_at=datetime('now')
          WHERE id=?`
       ).run(
         note, JSON.stringify(touched.proposals), fp,
-        touched.anchor.seg, touched.anchor.start, touched.anchor.end, actor.id, existing.id
+        touched.anchor.seg, touched.anchor.start, touched.anchor.end, actor.id,
+        cur.id, existing.id
       );
       responseId = existing.id;
       db.prepare(
@@ -897,6 +928,414 @@ function withdrawObjectionResponse(db, actor, id) {
       `INSERT INTO objection_logs (objection_id, actor_id, action, detail_json) VALUES (?,?, 'withdraw', ?)`
     ).run(id, actor.id, JSON.stringify({ responseId: r.id, version: r.version_id, note: r.note }));
   })();
+}
+
+// ---------- 预约发布 ----------
+// 预约时间解析：
+//  1) 带 UTC 偏移的 ISO 8601 字符串：2026-09-30T20:15:00+08:00 / ...Z / ...-05:30；
+//  2) 无时区的“墙上时间”字符串（YYYY-MM-DDTHH:mm[:ss]）须同时给 utcOffsetMinutes；
+//  3) 纯数字视为 epoch 毫秒（可再给 utcOffsetMinutes 作展示偏移，缺省 0）。
+// 返回 { epochMs, offsetMin, input }；非法输入抛 400。
+function parseScheduleTime(body) {
+  let { scheduledAt, utcOffsetMinutes } = body || {};
+  if (typeof utcOffsetMinutes === 'string' && utcOffsetMinutes.trim() !== '') {
+    utcOffsetMinutes = Number(utcOffsetMinutes);
+  }
+  let offsetMin = Number.isInteger(utcOffsetMinutes) ? utcOffsetMinutes : null;
+  if (offsetMin !== null && (offsetMin < -720 || offsetMin > 840)) {
+    throw badRequest('UTC 偏移超出合法范围（须在 -12:00 与 +14:00 之间）');
+  }
+
+  let epochMs = null;
+  let input = '';
+  if (typeof scheduledAt === 'number' && Number.isFinite(scheduledAt)) {
+    epochMs = scheduledAt;
+    input = String(scheduledAt);
+    if (offsetMin === null) offsetMin = 0;
+  } else if (typeof scheduledAt === 'string' && scheduledAt.trim()) {
+    input = scheduledAt.trim();
+    const wall = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?/.exec(input);
+    // 严格日历校验（拒绝 2 月 31 日、25 点等被 JS 静默进位的值）
+    if (wall) {
+      const [, y, mo, d, h, mi, se] = wall;
+      const sec = se ? Math.floor(Number(se)) : 0;
+      const dt = new Date(Date.UTC(+y, +mo - 1, +d, +h, +mi, sec));
+      const valid = dt.getUTCFullYear() === +y && dt.getUTCMonth() === +mo - 1 &&
+        dt.getUTCDate() === +d && dt.getUTCHours() === +h &&
+        dt.getUTCMinutes() === +mi && dt.getUTCSeconds() === sec;
+      if (!valid) throw badRequest(`预约时间“${input}”不是有效的日历时间`);
+    }
+    const isoOffset = /(Z|[+-]\d{2}:?\d{2})$/i.exec(input);
+    if (isoOffset) {
+      const ms = Date.parse(input);
+      if (!Number.isFinite(ms)) throw badRequest(`无法解析预约时间“${input}”，请使用带 UTC 偏移的 ISO 8601 格式，如 2026-09-30T20:15:00+08:00`);
+      epochMs = ms;
+      if (offsetMin === null) offsetMin = offsetFromIso(isoOffset[1]);
+    } else {
+      if (!wall) {
+        throw badRequest('预约时间格式无效：请使用带 UTC 偏移的 ISO 8601（如 2026-09-30T20:15:00+08:00），或同时提供无时区时间与 utcOffsetMinutes');
+      }
+      if (offsetMin === null) {
+        throw badRequest('无时区的预约时间必须提供 utcOffsetMinutes（UTC 偏移分钟数，如 +08:00 为 480）');
+      }
+      const [, y, mo, d, h, mi, se] = wall;
+      epochMs = Date.UTC(+y, +mo - 1, +d, +h, +mi, se ? Math.floor(Number(se)) : 0) - offsetMin * 60000;
+    }
+  } else {
+    throw badRequest('缺少预约时间 scheduledAt（带 UTC 偏移的 ISO 8601 字符串，或 epoch 毫秒）');
+  }
+  return { epochMs, offsetMin, input };
+}
+
+function offsetFromIso(z) {
+  if (z === 'Z' || z === 'z') return 0;
+  const sign = z[0] === '-' ? -1 : 1;
+  const hh = parseInt(z.slice(1, 3), 10);
+  const mm = parseInt(z.replace(':', '').slice(3, 5), 10);
+  return sign * (hh * 60 + mm);
+}
+
+// epoch 毫秒 + UTC 偏移 → 该偏移下的墙上时间字符串 YYYY-MM-DD HH:mm:ss
+function wallTime(epochMs, offsetMin) {
+  const d = new Date(epochMs + offsetMin * 60000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+    `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+function offsetLabel(offsetMin) {
+  const sign = offsetMin < 0 ? '-' : '+';
+  const a = Math.abs(offsetMin);
+  return `UTC${sign}${String(Math.floor(a / 60)).padStart(2, '0')}:${String(a % 60).padStart(2, '0')}`;
+}
+
+// 预约前可发布性检查（与人工发布同一套规则）：未导入正文、暂存区为空、
+// 存在缺失/失效回应时均以原规则的错误码拒绝。返回 { cur, stage, touched }。
+function requirePublishable(db) {
+  const cur = latestVersion(db);
+  if (!cur) throw conflict('尚未导入逐字稿，暂无可发布的修订', 'NO_DOCUMENT');
+  const stage = stageProposals(db, cur.id);
+  if (stage.length === 0) {
+    throw conflict('预约发布被拒绝：暂存区中没有已采纳修订，预约必须包含修订', 'EMPTY_PUBLISH');
+  }
+  const touched = assertObjectionsResolved(db, cur, stage); // 闸门不通过抛 PENDING_OBJECTION_RESPONSES
+  return { cur, stage, touched };
+}
+
+// 固化预约时“受影响异议与有效回应”的关联快照
+function buildTouchedSnapshot(db, cur, touched) {
+  const getDraft = db.prepare(`SELECT * FROM objection_responses WHERE objection_id=? AND status='draft' AND version_id=?`);
+  const items = [];
+  for (const [objectionId, info] of touched) {
+    const r = getDraft.get(objectionId, cur.id); // 闸门已保证存在且有效
+    items.push({
+      objectionId,
+      anchor: info.anchor,
+      touchedProposalIds: [...info.proposals].sort((a, b) => a - b),
+      response: r
+        ? {
+            id: r.id,
+            note: r.note,
+            touchedProposalIds: JSON.parse(r.touched_proposal_ids_json || '[]').slice().sort((a, b) => a - b),
+            anchorSeg: r.anchor_seg,
+            anchorStart: r.anchor_start_cp,
+            anchorEnd: r.anchor_end_cp,
+            respondedBy: r.responded_by,
+          }
+        : null,
+    });
+  }
+  items.sort((a, b) => a.objectionId - b.objectionId);
+  return items;
+}
+
+// 预约创建：按现有规则确认可发布，记录当前版本、采纳提议集合、受影响异议与回应关联状态。
+function createSchedule(db, actor, body) {
+  const { epochMs, offsetMin, input } = parseScheduleTime(body);
+  const note = typeof body.note === 'string' ? body.note.trim() : '';
+  if (Date.now() >= epochMs) {
+    throw conflict('预约时间必须是未来时间（以服务器当前时间为准），请重新选择', 'SCHEDULE_TIME_NOT_FUTURE');
+  }
+
+  return runInImmediateTx(db, () => {
+    const pending = db.prepare(`SELECT id FROM publish_schedules WHERE status='pending'`).get();
+    if (pending) {
+      throw conflict(`已有待执行预约 #${pending.id}，同一时刻仅允许一个预约；请先取消后再重新预约`, 'SCHEDULE_ALREADY_EXISTS');
+    }
+    const { cur, stage, touched } = requirePublishable(db);
+    const snapshot = buildTouchedSnapshot(db, cur, touched);
+    const r = db.prepare(
+      `INSERT INTO publish_schedules
+        (status, scheduled_at, utc_offset_minutes, time_input, note,
+         base_version_id, base_stage_json, stage_fingerprint, touched_snapshot_json, created_by)
+       VALUES ('pending',?,?,?,?,?,?,?,?,?)`
+    ).run(
+      epochMs, offsetMin, input, note,
+      cur.id, JSON.stringify(stage.map((p) => ({ id: p.id, seg: p.seg, start: p.start_cp, end: p.end_cp, replacement: p.replacement }))),
+      stageFingerprint(stage), JSON.stringify(snapshot), actor.id
+    );
+    const id = r.lastInsertRowid;
+    addDecision(db, {
+      type: 'schedule_create',
+      versionId: cur.id,
+      actorId: actor.id,
+      reason: `预约于 ${wallTime(epochMs, offsetMin)} ${offsetLabel(offsetMin)} 发布（#${id}，暂存 ${stage.length} 项修订${note ? `，版本说明：${note}` : ''}）`,
+      detail: {
+        scheduleId: id, scheduledAt: epochMs, utcOffsetMinutes: offsetMin,
+        baseVersionId: cur.id, proposalIds: stage.map((p) => p.id),
+        touchedObjections: snapshot.map((s) => s.objectionId), note,
+      },
+    });
+    return id;
+  });
+}
+
+// 取消预约：仅限待执行预约；失效处理不调用本函数。
+function cancelSchedule(db, actor, id, reason) {
+  const s = db.prepare('SELECT * FROM publish_schedules WHERE id=?').get(id);
+  if (!s) throw notFound(`预约 #${id} 不存在`);
+  if (s.status !== 'pending') {
+    throw conflict(`预约 #${id} 当前状态为“${scheduleStatusLabel(s.status)}”，不能取消（仅待执行预约可取消）`, 'SCHEDULE_NOT_PENDING');
+  }
+  runInImmediateTx(db, () => {
+    // 条件更新：与到点执行（pending → executing/published）并发时，只有一方能终结预约
+    const cr = db
+      .prepare(
+        `UPDATE publish_schedules SET status='cancelled', cancelled_at=datetime('now'), invalid_reason=?
+         WHERE id=? AND status='pending'`
+      )
+      .run(typeof reason === 'string' && reason.trim() ? reason.trim() : '复核员在执行前取消预约', id);
+    if (cr.changes === 0) {
+      throw conflict(`预约 #${id} 已不再是待执行状态（可能刚到点执行），取消未生效`, 'SCHEDULE_NOT_PENDING');
+    }
+    addDecision(db, {
+      type: 'schedule_cancel',
+      versionId: s.base_version_id,
+      actorId: actor.id,
+      reason: `取消预约发布 #${id}（原定于 ${wallTime(s.scheduled_at, s.utc_offset_minutes)} ${offsetLabel(s.utc_offset_minutes)}）`,
+      detail: { scheduleId: id, baseVersionId: s.base_version_id },
+    });
+  });
+}
+
+// 到点（或人工核对时）重新核对预约快照与现有发布条件；不一致返回中文原因列表，一致返回空数组。
+// 核对维度：当前版本、暂存采纳提议集合与内容、受影响异议集合、各异议锚点与关联采纳提议集合、
+// 回应草稿绑定状态（存在/非空/锚点/关联集合/说明），最后再跑一遍现有发布闸门。
+function recheckSchedule(db, s) {
+  const reasons = [];
+  const cur = latestVersion(db);
+  if (!cur) return ['逐字稿不存在，无法执行预约发布'];
+  if (cur.id !== s.base_version_id) {
+    reasons.push(`当前版本已变化：预约时为 v${s.base_version_id}，当前为 v${cur.id}`);
+  }
+  const stage = stageProposals(db, cur.id);
+  const baseStage = JSON.parse(s.base_stage_json || '[]');
+  const wantIds = baseStage.map((p) => p.id).sort((a, b) => a - b);
+  const nowIds = stage.map((p) => p.id).sort((a, b) => a - b);
+  if (wantIds.join(',') !== nowIds.join(',')) {
+    reasons.push(
+      `暂存修订集合已变化：预约时为 #${wantIds.join(',#') || '（空）'}，当前暂存区为 #${nowIds.join(',#') || '（空）'}`
+    );
+  } else if (s.stage_fingerprint !== stageFingerprint(stage)) {
+    reasons.push('暂存修订内容已变化（采纳提议的段、范围或替换文字与预约快照不一致）');
+  }
+
+  const touched = touchedByStage(db, cur.id, stage);
+  const snap = JSON.parse(s.touched_snapshot_json || '[]');
+  const snapIds = snap.map((x) => x.objectionId).sort((a, b) => a - b);
+  const nowTouchedIds = [...touched.keys()].sort((a, b) => a - b);
+  if (snapIds.join(',') !== nowTouchedIds.join(',')) {
+    reasons.push(
+      `受影响异议集合已变化：预约时为 #${snapIds.join(',#') || '（无）'}，当前为 #${nowTouchedIds.join(',#') || '（无）'}`
+    );
+  }
+  for (const item of snap) {
+    const cur2 = touched.get(item.objectionId);
+    if (!cur2) {
+      reasons.push(`异议 #${item.objectionId} 已不被当前暂存修订触及`);
+      continue;
+    }
+    const a = item.anchor;
+    if (!a || a.seg !== cur2.anchor.seg || a.start !== cur2.anchor.start || a.end !== cur2.anchor.end) {
+      reasons.push(
+        `异议 #${item.objectionId} 当前锚点已变化：预约时为第 ${a ? a.seg : '?'} 段 ` +
+        `[${a ? a.start : '?'},${a ? a.end : '?'})，当前为第 ${cur2.anchor.seg} 段 [${cur2.anchor.start},${cur2.anchor.end})`
+      );
+    }
+    const wantP = [...cur2.proposals].sort((x, y) => x - y);
+    const boundP = (item.response && item.response.touchedProposalIds || []).slice().sort((x, y) => x - y);
+    if (wantP.join(',') !== boundP.join(',')) {
+      reasons.push(`异议 #${item.objectionId} 的回应关联采纳提议集合已变化（预约时 #${boundP.join(',#') || '（无）'}，当前 #${wantP.join(',#')}）`);
+    }
+    const r = item.response;
+    const draft = r
+      ? db.prepare(`SELECT * FROM objection_responses WHERE id=? AND status='draft'`).get(r.id)
+      : null;
+    if (!r || !draft) {
+      reasons.push(`异议 #${item.objectionId} 的有效回应已不存在（草稿被撤回或已随其他发布固化），须重新回应`);
+      continue;
+    }
+    if (draft.version_id !== cur.id) {
+      reasons.push(`异议 #${item.objectionId} 的回应绑定版本已变化（回应于 v${draft.version_id}，当前 v${cur.id}）`);
+    }
+    if (!(typeof draft.note === 'string' && draft.note.trim())) {
+      reasons.push(`异议 #${item.objectionId} 的回应说明为空`);
+    }
+    if (draft.anchor_seg !== cur2.anchor.seg || draft.anchor_start_cp !== cur2.anchor.start || draft.anchor_end_cp !== cur2.anchor.end) {
+      reasons.push(`异议 #${item.objectionId} 的回应绑定锚点已变化（异议可能已被重新定位）`);
+    }
+    if (draft.responded_by !== r.respondedBy) {
+      reasons.push(`异议 #${item.objectionId} 的回应被他人重填，须重新预约`);
+    }
+  }
+
+  // 再跑一遍现有发布闸门（覆盖新增受影响异议等待回应等所有既有规则）
+  try {
+    assertObjectionsResolved(db, cur, stage);
+  } catch (e) {
+    reasons.push(`现有发布条件不再满足：${e.message}`);
+  }
+  return [...new Set(reasons)];
+}
+
+// 将一个待执行预约标记为失效（不改动版本、提议与决议；调用方负责事务）
+function markScheduleInvalid(db, id, reason) {
+  db.prepare(
+    `UPDATE publish_schedules SET status='invalidated', invalid_reason=?, invalidated_at=datetime('now') WHERE id=? AND status IN ('pending','executing')`
+  ).run(Array.isArray(reason) ? reason.join('；') : reason, id);
+}
+
+// 使全部待执行预约失效（人工发布后在同一事务内调用；或定时巡检在独立事务内调用）。
+// 返回失效的预约 id 列表。
+function invalidatePendingSchedules(db, { reason, tx = false } = {}) {
+  const run = () => {
+    const ids = db.prepare(`SELECT id FROM publish_schedules WHERE status='pending'`).all().map((x) => x.id);
+    for (const id of ids) markScheduleInvalid(db, id, reason);
+    return ids;
+  };
+  return tx ? run() : db.transaction(run)();
+}
+
+// 巡检：核对所有待执行预约，快照已与现状不符的标记失效（不改动版本/提议/决议）。
+// 返回 { checked, invalidated:[{id,reasons}] }
+function reconcileSchedules(db) {
+  const pending = db.prepare(`SELECT * FROM publish_schedules WHERE status='pending'`).all();
+  const invalidated = [];
+  const tx = db.transaction(() => {
+    for (const s of pending) {
+      const reasons = recheckSchedule(db, s);
+      if (reasons.length) {
+        markScheduleInvalid(db, s.id, reasons);
+        invalidated.push({ id: s.id, reasons });
+      }
+    }
+  });
+  tx();
+  return { checked: pending.length, invalidated };
+}
+
+// 到点执行：在同一事务内领取预约 → 重新核对快照与发布条件 →
+// 一致才生成一个不可变版本并固化回应；不一致则标记失效。与人工发布并发或重复触发时，
+// 条件 UPDATE 领取保证至多一个执行者生成新版本。
+function executeDueSchedules(db, nowMs = Date.now()) {
+  const results = [];
+  const due = db
+    .prepare(`SELECT * FROM publish_schedules WHERE status='pending' AND scheduled_at <= ? ORDER BY scheduled_at, id`)
+    .all(nowMs);
+  for (const s of due) {
+    const outcome = runInImmediateTx(db, () => {
+      const claim = db
+        .prepare(`UPDATE publish_schedules SET status='executing' WHERE id=? AND status='pending'`)
+        .run(s.id);
+      if (claim.changes === 0) return null; // 已被并发领取（人工/重复触发）
+      const cur = db.prepare('SELECT * FROM versions WHERE id=?').get(s.base_version_id);
+      const live = db.prepare('SELECT * FROM publish_schedules WHERE id=?').get(s.id);
+      const stage = stageProposals(db, s.base_version_id);
+      const reasons = recheckSchedule(db, live);
+      if (reasons.length) {
+        markScheduleInvalid(db, s.id, reasons);
+        return { id: s.id, status: 'invalidated', reasons };
+      }
+      // 以预约创建人身份发布；版本说明沿用预约时填写的说明
+      const actor = db.prepare('SELECT * FROM users WHERE id=?').get(s.created_by);
+      const newId = commitPublish(db, actor, s.note, cur, stage, segmentsOf(cur));
+      db.prepare(
+        `UPDATE publish_schedules SET status='published', published_version_id=?, executed_at=datetime('now') WHERE id=?`
+      ).run(newId, s.id);
+      addDecision(db, {
+        type: 'schedule_run',
+        versionId: newId,
+        actorId: actor.id,
+        reason: `预约 #${s.id} 到点执行：重新核对预约快照与发布条件一致，生成不可变 v${newId}` +
+          `（预约时刻 ${wallTime(s.scheduled_at, s.utc_offset_minutes)} ${offsetLabel(s.utc_offset_minutes)}）`,
+        detail: {
+          scheduleId: s.id, publishedVersionId: newId, baseVersionId: s.base_version_id,
+          proposalIds: stage.map((p) => p.id),
+        },
+      });
+      finishWatermark(db, newId);
+      return { id: s.id, status: 'published', versionId: newId };
+    });
+    if (outcome) results.push(outcome);
+  }
+  return results;
+}
+
+function scheduleStatusLabel(status) {
+  return ({
+    pending: '待执行',
+    executing: '执行中',
+    published: '已执行',
+    cancelled: '已取消',
+    invalidated: '已失效',
+  })[status] || status;
+}
+
+function scheduleView(db, s) {
+  const creator = db.prepare('SELECT display_name, username FROM users WHERE id=?').get(s.created_by);
+  return {
+    id: s.id,
+    status: s.status,
+    statusLabel: scheduleStatusLabel(s.status),
+    scheduledAt: s.scheduled_at,
+    scheduledAtUTC: new Date(s.scheduled_at).toISOString(),
+    wallTime: wallTime(s.scheduled_at, s.utc_offset_minutes),
+    utcOffsetMinutes: s.utc_offset_minutes,
+    utcOffset: offsetLabel(s.utc_offset_minutes),
+    timeInput: s.time_input,
+    note: s.note,
+    baseVersionId: s.base_version_id,
+    proposalIds: JSON.parse(s.base_stage_json || '[]').map((p) => p.id),
+    touchedObjectionIds: JSON.parse(s.touched_snapshot_json || '[]').map((x) => x.objectionId),
+    createdBy: creator ? `${creator.display_name}(${creator.username})` : '',
+    creatorUser: creator ? creator.username : '',
+    creatorName: creator ? creator.display_name : '',
+    createdAt: s.created_at,
+    invalidReason: s.invalid_reason || '',
+    invalidReasons: s.status === 'invalidated' && s.invalid_reason ? s.invalid_reason.split('；').filter(Boolean) : [],
+    cancelledAt: s.cancelled_at,
+    executedAt: s.executed_at,
+    publishedVersionId: s.published_version_id,
+  };
+}
+
+function listSchedules(db) {
+  const rows = db
+    .prepare(
+      `SELECT * FROM (
+         SELECT * FROM publish_schedules WHERE status='pending'
+         UNION ALL
+         SELECT * FROM publish_schedules WHERE status<>'pending' ORDER BY id DESC LIMIT 20
+       ) ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC`
+    )
+    .all();
+  return rows.map((s) => scheduleView(db, s));
+}
+
+// 预约面板：待执行预约（至多 1 条）+ 最近历史
+function schedulePanel(db) {
+  reconcileSchedules(db);
+  const all = listSchedules(db);
+  return { pending: all.find((x) => x.status === 'pending') || null, recent: all.filter((x) => x.status !== 'pending') };
 }
 
 // ---------- 视图组装 ----------
@@ -953,6 +1392,7 @@ function boothView(db) {
     proposals: listProposals(db),
     objections: listObjections(db),
     reviewChecklist: reviewChecklist(db, ver.id),
+    schedule: schedulePanel(db),
     versions: db
       .prepare(
         `SELECT v.id, v.note, v.created_at, u.display_name AS creator_name
@@ -1050,4 +1490,12 @@ module.exports = {
   getDoc,
   latestVersion,
   segmentsOf,
+  parseScheduleTime,
+  createSchedule,
+  cancelSchedule,
+  executeDueSchedules,
+  reconcileSchedules,
+  invalidatePendingSchedules,
+  schedulePanel,
+  listSchedules,
 };

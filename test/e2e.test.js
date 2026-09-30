@@ -52,6 +52,10 @@ function cpIndexOf(text, needle) {
 async function main() {
   require('../src/server');
   await new Promise((r) => setTimeout(r, 400));
+  // 与 HTTP 服务同一个 SQLite 文件的只读/维护连接（用于重启逾期场景的直接核查）
+  const Database = require('better-sqlite3');
+  const { DB_PATH } = require('../src/db');
+  const db = new Database(DB_PATH);
 
   console.log('\n[认证与权限]');
   const rec = await login('recorder', 'recorder123');
@@ -268,12 +272,9 @@ async function main() {
   await expectFail(req('POST', '/api/proposals/9999/rebase-preview', {}, rec), 404, '不存在', '续提不存在的提议');
 
   // 第二名记录员（非本人）——直接落库建号后登录
-  const { hashPassword, DB_PATH } = require('../src/db');
-  const Database = require('better-sqlite3');
-  const raw = new Database(DB_PATH);
-  raw.prepare(`INSERT INTO users (username, display_name, role, password_hash) VALUES (?,?,?,?)`)
+  const { hashPassword } = require('../src/db');
+  db.prepare(`INSERT INTO users (username, display_name, role, password_hash) VALUES (?,?,?,?)`)
     .run('recorder2', '记录员乙', 'recordist', hashPassword('recorder234'));
-  raw.close();
   const rec2 = await login('recorder2', 'recorder234');
   await expectFail(req('POST', `/api/proposals/${pid4}/rebase-preview`, {}, rec2), 403, '本人', '非本人提议拒绝续提');
 
@@ -620,6 +621,305 @@ async function main() {
   // 重定位后第3段插入点修订不再触及该异议 → 无受影响异议，可直接发布
   const pubZ = await req('POST', '/api/publish', { note: '插入点修订发布（无受影响异议）' }, rev);
   ok(pubZ.status === 201, '没有受影响异议时仍可按原规则发布');
+
+  console.log('\n[预约发布：预约校验（时间/暂存区/权限/唯一性）]');
+  // 当前 v11，暂存区为空
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  const vBeforeSchedule = booth.currentVersion.id;
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: new Date(Date.now() + 60000).toISOString(), note: '空暂存' }, rev),
+    409, '暂存区中没有已采纳修订', '暂存区为空拒绝预约');
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: 'not-a-time', note: 'x' }, rev),
+    400, '预约时间格式无效', '非法时间字符串拒绝预约');
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: '2026-09-30T20:00:00', note: 'x' }, rev),
+    400, 'utcOffsetMinutes', '无偏移的墙上时间缺少 UTC 偏移拒绝预约');
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: '2026-09-30T20:00:00', utcOffsetMinutes: 9999, note: 'x' }, rev),
+    400, 'UTC 偏移超出合法范围', '越界 UTC 偏移拒绝预约');
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: new Date(Date.now() - 1000).toISOString(), note: '过去' }, rev),
+    409, '必须是未来时间', '非未来时间拒绝预约');
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: new Date(Date.now() + 60000).toISOString() }, rec),
+    403, '无权操作', '记录员尝试预约');
+  await expectFail(req('POST', '/api/publish-schedules', { scheduledAt: new Date(Date.now() + 60000).toISOString() }, par),
+    403, '无权操作', '参与者尝试预约');
+
+  // 准备一条可发布修订：第4段当前正文含“王武”（v5 改过），改另一个范围
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const seg4sched = booth.segments.find((s) => s.seg === 4).text;
+  const iSched = cpIndexOf(seg4sched, '王武');
+  const ps1 = await req('POST', '/api/proposals',
+    { seg: 4, start: iSched, end: iSched + 2, replacement: '王伍', basis: '预约发布-用字订正' }, rec);
+  assert.strictEqual(ps1.status, 201);
+  await req('POST', `/api/proposals/${ps1.json.id}/adopt`, {}, rev);
+
+  // 预约时也走异议闸门：第4段无异议 → 可预约
+  const t1 = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const sc1 = await req('POST', '/api/publish-schedules',
+    { scheduledAt: t1, note: '预约版本说明' }, rev);
+  assert.strictEqual(sc1.status, 201, '可发布状态下预约成功');
+  const sid1 = sc1.json.id;
+  ok(sid1 >= 1, `预约 #${sid1} 已创建（未来 1 小时）`);
+
+  // 同一时刻仅一个待执行预约
+  await expectFail(req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 7200000).toISOString(), note: '第二个' }, rev),
+    409, '同一时刻仅允许一个预约', '已有待执行预约时拒绝再约');
+
+  // 页面展示预约时间、创建人、状态
+  let panel = (await req('GET', '/api/publish-schedules', null, par)).json;
+  ok(panel.pending && panel.pending.id === sid1 && panel.pending.status === 'pending'
+    && panel.pending.creatorUser === 'reviewer' && panel.pending.note === '预约版本说明'
+    && JSON.stringify(panel.pending.proposalIds) === JSON.stringify([ps1.json.id]),
+    '预约面板展示时间/创建人/状态/采纳提议集合');
+  ok(panel.pending.scheduledAtUTC === new Date(t1).toISOString()
+    && panel.pending.wallTime && panel.pending.utcOffset === 'UTC+00:00',
+    '预约时间同时给出绝对时刻与墙上时间/偏移');
+  booth = (await req('GET', '/api/booth', null, par)).json;
+  ok(booth.schedule.pending && booth.schedule.pending.id === sid1, '总览携带待执行预约');
+
+  console.log('\n[预约发布：执行前取消]');
+  await expectFail(req('POST', `/api/publish-schedules/${sid1}/cancel`, {}, rec), 403, '无权操作', '记录员尝试取消预约');
+  const cn = await req('POST', `/api/publish-schedules/${sid1}/cancel`, { reason: '复核员改期' }, rev);
+  ok(cn.status === 200, '复核员可在执行前取消预约');
+  panel = (await req('GET', '/api/publish-schedules', null, rev)).json;
+  ok(!panel.pending && panel.recent.some((x) => x.id === sid1 && x.status === 'cancelled'),
+    '取消后无待执行预约，历史记录标记已取消');
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.currentVersion.id === vBeforeSchedule && booth.stage.length === 1
+    && booth.proposals.find((x) => x.id === ps1.json.id).status === 'adopted',
+    '取消预约不改动版本、提议与暂存区');
+  // 取消后可以重新预约
+  const sc1b = await req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 3600000).toISOString(), note: '重新预约' }, rev);
+  ok(sc1b.status === 201, '取消后允许重新预约');
+  await req('POST', `/api/publish-schedules/${sc1b.json.id}/cancel`, {}, rev);
+
+  console.log('\n[预约发布：到点一致 → 生成不可变版本并固化回应]');
+  // 布置一条触及异议的修订，使预约快照包含“受影响异议 + 有效回应”
+  booth = (await req('GET', '/api/booth', null, par)).json;
+  const seg5now = booth.segments.find((s) => s.seg === 5).text;
+  const schedObjLen = Math.min(3, Array.from(seg5now).length);
+  const ogs = await req('POST', '/api/objections',
+    { seg: 5, start: 0, end: schedObjLen, note: '预约发布触及的异议' }, par);
+  assert.strictEqual(ogs.status, 201);
+  const ogsid = ogs.json.id;
+  const pso = await req('POST', '/api/proposals',
+    { seg: 5, start: 0, end: schedObjLen, replacement: '【预约核】', basis: '预约-相交修订' }, rec);
+  assert.strictEqual(pso.status, 201);
+  await req('POST', `/api/proposals/${pso.json.id}/adopt`, {}, rev);
+  // 预约前必须先回应（与人工发布同一闸门）
+  await expectFail(req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 3600000).toISOString(), note: '未回应' }, rev),
+    409, '未逐条回应或回应已失效', '存在缺失回应时拒绝预约');
+  // 第5段历史上可能留有其他被本次修订触及的异议锚点：对全部 missing/invalid 项逐条回应
+  let chkSched = (await req('GET', '/api/review-checklist', null, rev)).json;
+  for (const it of chkSched.items) {
+    if (it.state === 'missing' || it.state === 'invalid') {
+      const rr = await req('POST', `/api/objections/${it.objectionId}/respond`,
+        { note: it.objectionId === ogsid ? '预约发布前回应：已核对，异议随预约版本留档。' : '预约发布前补回应：已核对留档。' }, rev);
+      assert.strictEqual(rr.status, 201);
+    }
+  }
+  chkSched = (await req('GET', '/api/review-checklist', null, rev)).json;
+  ok(chkSched.items.every((x) => x.state === 'responded' || x.state === 'orphan'),
+    '预约前全部受影响异议均已有效回应');
+  const dueAt = new Date(Date.now() + 1200).toISOString();
+  const sc2 = await req('POST', '/api/publish-schedules',
+    { scheduledAt: dueAt, note: '预约到期发布' }, rev);
+  assert.strictEqual(sc2.status, 201);
+  const sid2 = sc2.json.id;
+  const vSchedBase = (await req('GET', '/api/booth', null, rev)).json.currentVersion.id;
+  // 到点前不发布
+  await new Promise((r) => setTimeout(r, 500));
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.currentVersion.id === vSchedBase, '预约时刻未到：不提前发布');
+  // 等待调度器（500ms 间隔）执行
+  await new Promise((r) => setTimeout(r, 1600));
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  const expectedV = vSchedBase + 1;
+  ok(booth.currentVersion.id === expectedV && booth.currentVersion.note === '预约到期发布',
+    `到点一致：自动生成不可变 v${expectedV}，版本说明为预约时填写的说明`);
+  panel = (await req('GET', '/api/publish-schedules', null, rev)).json;
+  const done = panel.recent.find((x) => x.id === sid2);
+  ok(done.status === 'published' && done.publishedVersionId === expectedV && !done.invalidReason,
+    '预约记录标记已执行并回填生成的版本号');
+  // 回应随预约版本固化
+  const vSched = (await req('GET', `/api/versions/${expectedV}`, null, par)).json;
+  const rv = vSched.responses.find((x) => x.objectionId === ogsid);
+  ok(rv && rv.note.includes('预约发布前回应')
+    && JSON.stringify(rv.touchedProposalIds) === JSON.stringify([pso.json.id]),
+    '预约发布同样固化被触及异议的回应与关联提议');
+  ok(vSched.decisions.some((d) => d.type === 'schedule_create' && d.reason.includes(`#${sid2}`))
+    && vSched.decisions.some((d) => d.type === 'schedule_run' && d.version_id === expectedV),
+    '历史版本决议视图含预约创建与到点执行留痕');
+  // 预约时的暂存提议随版发布
+  ok(vSched.segments.find((s) => s.seg === 5).text.startsWith('【预约核】'),
+    '预约发布的正文合并结果正确');
+
+  console.log('\n[预约发布：快照变化 → 到点失效，不改版本/提议/决议]');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const seg5v = booth.segments.find((s) => s.seg === 5).text;
+  const psx = await req('POST', '/api/proposals',
+    { seg: 5, start: Array.from(seg5v).length - 1, end: Array.from(seg5v).length, replacement: seg5v.slice(-1) + '！', basis: '失效-尾标' }, rec);
+  assert.strictEqual(psx.status, 201);
+  await req('POST', `/api/proposals/${psx.json.id}/adopt`, {}, rev);
+  const sc3 = await req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 3600000).toISOString(), note: '将失效' }, rev);
+  assert.strictEqual(sc3.status, 201);
+  const sid3 = sc3.json.id;
+  const vBeforeInvalid = (await req('GET', '/api/booth', null, rev)).json.currentVersion.id;
+  // 变化一：驳回暂存中的采纳提议 → 暂存集合变化
+  await req('POST', `/api/proposals/${psx.json.id}/reject`, { reason: '变化' }, rev);
+  // 仅查询即触发重新核对并标记失效（GET /api/booth 与 /api/publish-schedules 都会巡检）
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  let rec3 = booth.schedule.recent.find((x) => x.id === sid3);
+  ok(rec3.status === 'invalidated'
+    && rec3.invalidReasons.some((r) => r.includes('暂存修订集合已变化')),
+    '暂存采纳集合变化：预约标记失效并给出原因');
+  ok(booth.currentVersion.id === vBeforeInvalid
+    && booth.proposals.find((x) => x.id === psx.json.id).status === 'rejected',
+    '失效处理不改动版本（提议按正常驳回流转，非失效副作用）');
+
+  // 变化二：人工发布抢先 → 预约在发布同一事务内失效（被驳回的提议不可再采纳，另提新修订）
+  const seg5v2 = (await req('GET', '/api/booth', null, rec)).json.segments.find((s) => s.seg === 5).text;
+  const psy = await req('POST', '/api/proposals',
+    { seg: 5, start: 0, end: 1, replacement: '〈预〉', basis: '人工抢先' }, rec);
+  assert.strictEqual(psy.status, 201);
+  await req('POST', `/api/proposals/${psy.json.id}/adopt`, {}, rev);
+  // 该修订可能触及已发布后重新产生的异议锚点；按清单补齐回应
+  let chkPub = (await req('GET', '/api/review-checklist', null, rev)).json;
+  for (const it of chkPub.items) {
+    if (it.state === 'missing' || it.state === 'invalid') {
+      await req('POST', `/api/objections/${it.objectionId}/respond`,
+        { note: `人工发布前补回应 ${it.touchedProposalIds.map((x) => '#' + x).join('、')}` }, rev);
+    }
+  }
+  const sc4 = await req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 3600000).toISOString(), note: '将被抢先' }, rev);
+  assert.strictEqual(sc4.status, 201);
+  const sid4 = sc4.json.id;
+  const vBeforeManual = (await req('GET', '/api/booth', null, rev)).json.currentVersion.id;
+  const manual = await req('POST', '/api/publish', { note: '人工抢先发布' }, rev);
+  ok(manual.status === 201 && manual.json.versionId === vBeforeManual + 1, '人工发布成功生成新版本');
+  panel = (await req('GET', '/api/publish-schedules', null, rev)).json;
+  const rec4 = panel.recent.find((x) => x.id === sid4);
+  ok(rec4.status === 'invalidated' && rec4.invalidReason.includes('版本已变化'),
+    '人工发布在同一事务内使待执行预约失效');
+  // 等到原预约时刻之后也不得再补发版本（至多一个新版本）
+  await new Promise((r) => setTimeout(r, 300));
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.currentVersion.id === manual.json.versionId && booth.schedule.pending === null,
+    '失效预约不会被定时器补发：版本不重复增加');
+
+  console.log('\n[预约发布：受影响异议/回应关联变化 → 失效]');
+  // 第4段放一条修订并采纳；在其上新建一条必相交异议，回应后预约，再撤回回应 → 失效
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const seg4cur = booth.segments.find((s) => s.seg === 4).text;
+  const s4len = Array.from(seg4cur).length;
+  const psz = await req('POST', '/api/proposals',
+    { seg: 4, start: 0, end: Math.min(2, s4len), replacement: '④', basis: '异议联动' }, rec);
+  assert.strictEqual(psz.status, 201);
+  await req('POST', `/api/proposals/${psz.json.id}/adopt`, {}, rev);
+  const ogz = await req('POST', '/api/objections',
+    { seg: 4, start: 0, end: Math.min(2, s4len), note: '关联变化异议' }, par);
+  assert.strictEqual(ogz.status, 201);
+  chkPub = (await req('GET', '/api/review-checklist', null, rev)).json;
+  for (const it of chkPub.items) {
+    if (it.state === 'missing' || it.state === 'invalid') {
+      await req('POST', `/api/objections/${it.objectionId}/respond`,
+        { note: it.objectionId === ogz.json.id ? '预约前回应（新异议）。' : '预约前补回应。' }, rev);
+    }
+  }
+  chkPub = (await req('GET', '/api/review-checklist', null, rev)).json;
+  ok(chkPub.items.some((x) => x.objectionId === ogz.json.id && x.state === 'responded'),
+    '新异议被修订触及且回应有效，纳入预约快照');
+  const sc5 = await req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 3600000).toISOString(), note: '回应将被撤回' }, rev);
+  assert.strictEqual(sc5.status, 201, '回应齐备时预约成功');
+  const sid5 = sc5.json.id;
+  // 撤回该被触及异议的有效回应 → 快照中回应关联失效
+  await req('DELETE', `/api/objections/${ogz.json.id}/response`, null, rev);
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  const rec5 = booth.schedule.recent.find((x) => x.id === sid5);
+  ok(rec5.status === 'invalidated'
+    && rec5.invalidReasons.some((r) => r.includes('有效回应已不存在') || r.includes('发布条件不再满足')),
+    '撤回有效回应：预约失效且原因可见');
+
+  console.log('\n[预约发布：服务重启后立即核查逾期预约]');
+  // 造一个干净可发布状态（无受影响异议）并预约到 1 小时后
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const seg1r = booth.segments.find((s) => s.seg === 1).text;
+  const psr = await req('POST', '/api/proposals',
+    { seg: 1, start: 0, end: Math.min(2, Array.from(seg1r).length), replacement: seg1r.slice(0, 2) + '　', basis: '重启逾期' }, rec);
+  assert.strictEqual(psr.status, 201);
+  await req('POST', `/api/proposals/${psr.json.id}/adopt`, {}, rev);
+  // 若触及异议（段1可能有历史异议锚点），先回应
+  chkPub = (await req('GET', '/api/review-checklist', null, rev)).json;
+  for (const it of chkPub.items) {
+    if (it.state === 'missing' || it.state === 'invalid') {
+      await req('POST', `/api/objections/${it.objectionId}/respond`, { note: '重启逾期前回应。' }, rev);
+    }
+  }
+  const sc6 = await req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 3600000).toISOString(), note: '重启逾期预约' }, rev);
+  assert.strictEqual(sc6.status, 201);
+  const sid6 = sc6.json.id;
+  const vBeforeRestart = (await req('GET', '/api/booth', null, rev)).json.currentVersion.id;
+  // 直接落库把预约时刻改到过去（模拟服务停机期间错过预约时刻）
+  db.prepare('UPDATE publish_schedules SET scheduled_at=? WHERE id=?').run(Date.now() - 2000, sid6);
+  // 直接调用调度器一次（等价于重启后立即核查）：不重新启动 HTTP 服务，直接走 store 层
+  const store = require('../src/store');
+  store.reconcileSchedules(db); // 巡检不应提前执行（仍 pending，因 executeDue 未跑）
+  const rawRow = db.prepare('SELECT status FROM publish_schedules WHERE id=?').get(sid6);
+  ok(rawRow.status === 'pending', '未到时巡检只做失效核对，不改未逾期/仍一致预约的状态');
+  // 启动时立即核查（executeDueSchedules）→ 逾期且一致 → 立即发布
+  const ran = store.executeDueSchedules(db);
+  ok(Array.isArray(ran) && ran.some((x) => x.id === sid6 && x.status === 'published'),
+    '重启后立即核查：逾期且快照一致的预约被执行');
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.currentVersion.id === vBeforeRestart + 1,
+    `重启逾期预约生成 v${vBeforeRestart + 1}（未到时预约继续保留，已逾期立即处理）`);
+  // 重复触发：再次执行不得再生成版本
+  const ran2 = store.executeDueSchedules(db);
+  ok(!ran2.some((x) => x.id === sid6), '重复触发已执行预约：幂等，不再生成新版本');
+
+  console.log('\n[预约发布：人工发布与到点执行并发 → 至多一个新版本]');
+  // 准备下一条可发布修订（回应全部受影响异议），预约到 1 秒后；在预约时刻同时发起人工发布，
+  // 二者并发只允许生成一个新版本
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const seg4race = booth.segments.find((s) => s.seg === 4).text;
+  const raceLen = Array.from(seg4race).length;
+  // 选一个与现有暂存/已用范围不冲突的位置：段4末尾 2 码点
+  const psRace = await req('POST', '/api/proposals',
+    { seg: 4, start: Math.max(0, raceLen - 2), end: raceLen, replacement: '终', basis: '并发-末字' }, rec);
+  assert.strictEqual(psRace.status, 201);
+  await req('POST', `/api/proposals/${psRace.json.id}/adopt`, {}, rev);
+  chkPub = (await req('GET', '/api/review-checklist', null, rev)).json;
+  for (const it of chkPub.items) {
+    if (it.state === 'missing' || it.state === 'invalid') {
+      await req('POST', `/api/objections/${it.objectionId}/respond`, { note: '并发前回应。' }, rev);
+    }
+  }
+  const vRaceBase = (await req('GET', '/api/booth', null, rev)).json.currentVersion.id;
+  const scRace = await req('POST', '/api/publish-schedules',
+    { scheduledAt: new Date(Date.now() + 800).toISOString(), note: '并发预约' }, rev);
+  assert.strictEqual(scRace.status, 201);
+  const sidRace = scRace.json.id;
+  // 等到预约时刻，同时（同一微任务批次）发起人工 HTTP 发布与直接调度执行
+  await new Promise((r) => setTimeout(r, 850));
+  const [manualRace, autoRace] = await Promise.all([
+    req('POST', '/api/publish', { note: '并发人工' }, rev),
+    Promise.resolve().then(() => store.executeDueSchedules(db)),
+  ]);
+  const newVersions = [];
+  if (manualRace.status === 201) newVersions.push(manualRace.json.versionId);
+  for (const x of autoRace) if (x.status === 'published') newVersions.push(x.versionId);
+  ok(newVersions.length === 1 && newVersions[0] === vRaceBase + 1,
+    `人工发布与到点执行并发：仅生成一个新版本 v${vRaceBase + 1}（实际 ${newVersions.join(',') || '无'}）`);
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.currentVersion.id === vRaceBase + 1 && booth.schedule.pending === null,
+    '并发结束后版本只前进一版，预约已终结（已执行或被人工发布置失效）');
+  const raceRow = db.prepare('SELECT status, published_version_id FROM publish_schedules WHERE id=?').get(sidRace);
+  ok(raceRow.status === 'published' || raceRow.status === 'invalidated',
+    `并发后预约状态终结为 ${raceRow.status}，无残留待执行预约`);
 
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);

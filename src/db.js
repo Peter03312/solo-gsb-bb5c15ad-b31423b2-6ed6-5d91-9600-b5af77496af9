@@ -24,6 +24,7 @@ function openDb() {
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000');
   initSchema(db);
   seed(db);
   return db;
@@ -158,6 +159,39 @@ function initSchema(db) {
   CREATE UNIQUE INDEX IF NOT EXISTS idx_responses_one_draft
     ON objection_responses(objection_id) WHERE status = 'draft';
   CREATE INDEX IF NOT EXISTS idx_responses_published ON objection_responses(published_version_id);
+
+  -- 预约发布：复核员把当前暂存修订预约到未来某个带 UTC 偏移的时刻发布。
+  -- 同一时刻只允许一个 pending 预约（部分唯一索引保证）；status 流转：
+  --   pending（待执行）→ executing（到点领取，事务内瞬时态）→ published（已执行，生成不可变版本）
+  --   pending → cancelled（执行前取消）/ invalidated（到点核对快照不一致，失效）
+  -- base_version_id / base_stage_json / touched_snapshot_json 固化预约时的版本、暂存修订集合
+  -- 与受影响异议、回应关联状态；到点在同一事务内重新核对，一致才发布，否则置 invalidated。
+  -- 失效处理不改动版本、提议与决议，须重新预约。
+  CREATE TABLE IF NOT EXISTS publish_schedules (
+    id          INTEGER PRIMARY KEY,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','executing','published','cancelled','invalidated')),
+    scheduled_at INTEGER NOT NULL,                         -- 预约时刻（epoch 毫秒，UTC 绝对时间）
+    utc_offset_minutes INTEGER NOT NULL DEFAULT 0,         -- 提交时的 UTC 偏移（分钟），用于展示
+    time_input  TEXT NOT NULL DEFAULT '',                  -- 原始时间输入（留痕）
+    note        TEXT NOT NULL DEFAULT '',                  -- 预约时填写的版本说明
+    base_version_id INTEGER NOT NULL REFERENCES versions(id),
+    base_stage_json TEXT NOT NULL DEFAULT '[]',            -- 预约时采纳提议快照（id/段/范围/替换文字）
+    stage_fingerprint TEXT NOT NULL DEFAULT '',            -- 预约时暂存区指纹
+    touched_snapshot_json TEXT NOT NULL DEFAULT '[]',      -- 受影响异议及回应关联状态快照
+    created_by  INTEGER NOT NULL REFERENCES users(id),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    invalid_reason TEXT NOT NULL DEFAULT '',               -- 未发布原因（失效原因；待执行时为空）
+    invalidated_at TEXT,
+    cancelled_at TEXT,
+    executed_at  TEXT,
+    published_version_id INTEGER REFERENCES versions(id)
+  );
+
+  -- 同一时刻仅允许一个待执行（或执行中）预约：部分唯一索引以常量为键
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_one_pending
+    ON publish_schedules((1)) WHERE status IN ('pending','executing');
+  CREATE INDEX IF NOT EXISTS idx_schedules_status ON publish_schedules(status, scheduled_at);
   `);
 
   // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别

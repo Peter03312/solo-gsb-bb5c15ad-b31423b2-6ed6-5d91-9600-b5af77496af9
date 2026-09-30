@@ -43,7 +43,7 @@ SQLite 数据库保存在命名卷 `hearing-revision-data`（容器内 `/data/he
 | 角色 | 用户名 | 密码 | 可执行操作 |
 | --- | --- | --- | --- |
 | 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议 |
-| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布新版本、重新定位异议 |
+| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布新版本或预约未来发布、重新定位异议 |
 | 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议 |
 
 种子账户仅在数据库用户表为空时创建；可通过环境变量覆盖用户名与密码（见下文配置）。
@@ -85,6 +85,7 @@ npm test
 | `DATA_DIR` | `./data`（本地）/ `/data`（容器） | SQLite 文件目录 |
 | `DB_PATH` | `$DATA_DIR/hearing.sqlite` | 数据库文件完整路径 |
 | `SESSION_TTL_MS` | `43200000` | 登录会话有效期（毫秒，默认 12 小时） |
+| `SCHEDULE_TICK_MS` | `500` | 预约发布调度巡检间隔（毫秒）；启动时总会立即核查一次 |
 | `SEED_RECORDIST_USER` / `SEED_RECORDIST_PASS` | `recorder` / `recorder123` | 记录员种子账户 |
 | `SEED_REVIEWER_USER` / `SEED_REVIEWER_PASS` | `reviewer` / `reviewer123` | 复核员种子账户 |
 | `SEED_PARTICIPANT_USER` / `SEED_PARTICIPANT_PASS` | `participant` / `participant123` | 参与者种子账户 |
@@ -133,6 +134,18 @@ npm test
    - 发布成功后回应随新版本固化，在**对应历史版本只读展示**；异议**原文快照**与既有**重定位规则**保持不变。
 8. **版本查看**：“版本”面板可只读查看任一历史版本的**正文、决议（采纳/驳回/冲突/续提/异议回应/发布留痕）与异议**；
    历史版本内容不随后续发布改变。
+9. **预约发布（本轮新增）**：复核员可把当前暂存修订预约在**未来某个带 UTC 偏移的时刻**自动发布，并填写版本说明。
+   - 预约时立即按**现有发布规则**确认可发布（未导入正文、暂存区为空、存在缺失/失效回应均拒绝），并记录
+     **当前版本、采纳提议的内容与集合、受影响异议与有效回应的关联状态**（回应 id/说明/锚点/关联提议/回应人）快照。
+   - **同一时刻仅允许一个待执行预约**；复核员可在执行前取消（记录员/参与者无权预约或取消）。
+   - 到点在**同一事务**中重新核对预约快照与现有发布条件：**一致才生成一个不可变版本并固化回应**；
+     当前版本、暂存修订（集合或内容）、受影响异议集合、任一异议锚点或其关联采纳提议集合、有效回应绑定
+     已变化，或现有发布条件不再满足 → 预约标记**“已失效”**并写明原因；**失效处理不改动版本、提议和决议，须重新预约**。
+   - **服务重启**后继续保留未到时预约，并**立即核查已逾期预约**（逾期且快照一致立即发布）；
+     与人工发布并发或定时器重复触发时，条件领取 + 同步事务保证**至多生成一个新版本**。
+   - 人工立即发布会在发布同一事务内把待执行预约标记失效（版本已推进）。
+   - 页面在正文下方与“版本”面板展示**预约时间（绝对时刻 + 指定 UTC 偏移墙上时间）、创建人、状态及未发布原因**；
+     有待执行预约时页面自动刷新。拒绝预约的场景：未导入正文、暂存区为空、时间无效或非未来时间、已有待执行预约。
 
 所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位等）均返回明确的
 HTTP 状态码与中文原因，且在数据库事务中执行——失败即回滚，不改变任何状态。
@@ -159,7 +172,10 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `POST /api/proposals/:id/reject` | 复核员 | 驳回（可含 `reason`） |
 | `POST /api/proposals/:id/rebase-preview` | 记录员（本人） | 续提预览：把“基版已过期”冲突提议的选区逐版换算到当前正文，返回目标选区/摘录/原替换文字与依据及确认凭证 |
 | `POST /api/proposals/:id/rebase-confirm` | 记录员（本人） | 确认续提 `{token}`：校验凭证（版本与暂存区未变、选区未被触及、不与暂存区交叠）后生成关联原提议的新待复核提议 |
-| `POST /api/publish` | 复核员 | 合并暂存修订并发布新版本；被触及异议存在缺失/失效回应时 409 拒绝（不改任何状态） |
+| `POST /api/publish` | 复核员 | 合并暂存修订并发布新版本；被触及异议存在缺失/失效回应时 409 拒绝（不改任何状态）。人工发布会使待执行预约在同一事务失效 |
+| `POST /api/publish-schedules` | 复核员 | 预约未来时间发布 `{scheduledAt, utcOffsetMinutes?, note?}`：预约时按现有规则确认可发布并固化版本/暂存/异议回应快照 |
+| `GET /api/publish-schedules` | 登录用户 | 预约面板：待执行预约（至多 1 条）与最近记录（预约时间、创建人、状态、未发布原因） |
+| `POST /api/publish-schedules/:id/cancel` | 复核员 | 执行前取消待执行预约 `{reason?}` |
 | `POST /api/objections` | 登录用户 | 对原文范围提出异议 `{seg,start,end,note}` |
 | `POST /api/objections/:id/relocate` | 提出者或复核员 | 对“待重新定位”的异议手动重定位 |
 | `GET /api/review-checklist` | 登录用户 | 当前版本发布前复核清单：被暂存修订触及的异议、关联提议、回应状态（missing/invalid/responded/orphan）与失效原因 |
@@ -183,10 +199,18 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
   `touched_proposal_ids_json` / `stage_fingerprint` / `anchor_*` 记录回应绑定的采纳提议集合、
   回应时暂存区快照与异议当前锚点；发布成功后置 `published` 并回填 `published_version_id`，
   在对应历史版本只读展示。
+- `publish_schedules`：预约发布。部分唯一索引保证同一时刻至多一条 `pending/executing`；
+  `scheduled_at`（epoch 毫秒）+ `utc_offset_minutes` 记录带 UTC 偏移的预约绝对时刻，
+  `base_version_id` / `base_stage_json` / `stage_fingerprint` / `touched_snapshot_json`
+  固化预约时的版本、采纳提议内容与集合、受影响异议及回应关联状态；
+  状态机 `pending → executing → published | invalidated | cancelled`，
+  `invalid_reason` 记录未发布原因，`published_version_id` 回填到点生成的不可变版本。
+  预约创建/取消/到点执行均追加 `decisions`（`schedule_create` / `schedule_cancel` / `schedule_run`）；
+  失效只更新预约行，不产生决议、不改动版本与提议。
 
 ---
 
-## 八、发布前异议回应：HTTP 调用示例
+## 七、发布前异议回应：HTTP 调用示例
 
 以下示例使用 `curl`（会话 Cookie 由 `/api/login` 下发；请先以 `reviewer` 登录）。
 
@@ -248,7 +272,92 @@ curl -b rev.cookie http://localhost:3000/api/versions/4
 
 ---
 
-## 七、目录结构
+## 八、预约发布：HTTP 调用示例
+
+预约时间两种传法（均须为**未来时间**，以服务器当前时间为准）：
+
+- 带偏移的 ISO 8601：`"2026-10-01T09:30:00+08:00"`、`"2026-09-30T20:15:00Z"`；
+- 无时区“墙上时间” + 显式 `utcOffsetMinutes`（`YYYY-MM-DDTHH:mm[:ss]`，偏移单位分钟，东八区为 `480`）；
+  也支持直接传 epoch 毫秒数。
+
+```bash
+# 1) 复核员登录
+curl -c rev.cookie -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"reviewer","password":"reviewer123"}'
+
+# 2) 采纳修订进入暂存区（并按需先逐条回应被触及异议，同第八节）后，预约次日 09:30（UTC+08:00）发布
+curl -b rev.cookie -X POST http://localhost:3000/api/publish-schedules \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scheduledAt": "2026-10-01T09:30:00",
+        "utcOffsetMinutes": 480,
+        "note": "听证结束后次日发布当日修订"
+      }'
+# {"ok":true,"id":1}
+
+# 等价写法：直接给带偏移的 ISO 8601
+curl -b rev.cookie -X POST http://localhost:3000/api/publish-schedules \
+  -H 'Content-Type: application/json' \
+  -d '{"scheduledAt":"2026-10-01T09:30:00+08:00","note":"听证结束后次日发布当日修订"}'
+
+# 3) 查看预约：时间（绝对时刻 + 偏移墙上时间）、创建人、状态、采纳/异议快照、未发布原因
+curl -b rev.cookie http://localhost:3000/api/publish-schedules
+# {
+#   "pending": {
+#     "id": 1, "status": "pending", "statusLabel": "待执行",
+#     "scheduledAt": 1790731800000,
+#     "scheduledAtUTC": "2026-10-01T01:30:00.000Z",
+#     "wallTime": "2026-10-01 09:30:00", "utcOffsetMinutes": 480, "utcOffset": "UTC+08:00",
+#     "note": "听证结束后次日发布当日修订",
+#     "baseVersionId": 3, "proposalIds": [12], "touchedObjectionIds": [1],
+#     "createdBy": "复核员(reviewer)", "createdAt": "2026-09-30 20:10:00",
+#     "invalidReason": ""
+#   },
+#   "recent": []
+# }
+
+# 4) 执行前取消（仅待执行预约可取消；可附原因）
+curl -b rev.cookie -X POST http://localhost:3000/api/publish-schedules/1/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":"需要再补一处修订，改期发布"}'
+# {"ok":true}
+
+# 5) 到点一致 → 自动生成不可变版本（亦可在 GET /api/booth、GET /api/publish-schedules 看到状态）
+#    到点不一致（版本/暂存/异议/回应任一变化）→ status="invalidated"，未发布原因示例：
+# {
+#   "pending": null,
+#   "recent": [{
+#     "id": 1, "status": "invalidated", "statusLabel": "已失效",
+#     "invalidReason": "暂存修订集合已变化：预约时为 #12，当前暂存区为 #（空）",
+#     "invalidReasons": ["暂存修订集合已变化：预约时为 #12，当前暂存区为 #（空）"],
+#     ...
+#   }]
+# }
+```
+
+拒绝预约（HTTP 状态码与中文原因）：
+
+| 场景 | 状态码 | `code` |
+| --- | --- | --- |
+| 未导入正文 / 暂存区为空 | 409 | `NO_DOCUMENT` / `EMPTY_PUBLISH` |
+| 时间格式无法解析、缺 UTC 偏移、偏移越界 | 400 | `BAD_REQUEST` |
+| 预约时间不是未来时间 | 409 | `SCHEDULE_TIME_NOT_FUTURE` |
+| 已有待执行预约 | 409 | `SCHEDULE_ALREADY_EXISTS` |
+| 被触及异议存在缺失/失效回应 | 409 | `PENDING_OBJECTION_RESPONSES`（结构化清单） |
+| 取消/操作非待执行预约 | 409 | `SCHEDULE_NOT_PENDING` |
+| 非复核员操作 | 403 | `FORBIDDEN` |
+
+调度行为：服务启动立即核查一次（重启后已逾期且快照一致的预约立即发布），之后每 500ms 巡检
+（可用环境变量 `SCHEDULE_TICK_MS` 调整）；定时器不阻止进程退出。与人工发布并发或重复触发时，
+预约行的条件领取（`pending → executing`）与 better-sqlite3 同步事务保证**至多生成一个新版本**。
+
+> 网页端：复核员在正文下方“发布条”展开“预约未来时间发布”，选择墙上时间与 UTC 偏移并填写版本说明即可；
+> 任何登录用户都能在正文上方信息条与“版本”面板看到预约时间、创建人、状态；失效时信息条展示**未发布原因**，
+> 复核员可取消或重新预约。
+
+---
+
+## 九、目录结构
 
 ```
 .
@@ -261,7 +370,8 @@ curl -b rev.cookie http://localhost:3000/api/versions/4
 │   ├── server.js            # Express 路由与错误出口
 │   ├── auth.js              # Cookie 会话与角色鉴权
 │   ├── db.js                # SQLite 连接、建表、种子账户
-│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图
+│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/预约发布
+│   ├── scheduler.js         # 预约发布调度：重启立即核查逾期预约 + 周期到点执行
 │   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算
 ├── public                   # 浏览器前端（原生 HTML/CSS/JS，无构建步骤）
 │   ├── index.html

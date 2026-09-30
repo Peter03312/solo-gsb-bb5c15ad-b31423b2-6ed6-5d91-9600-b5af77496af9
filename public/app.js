@@ -60,6 +60,7 @@ const STATUS_LABEL = {
 const DECISION_LABEL = {
   adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布', rebase: '续提',
   objection_respond: '异议回应',
+  schedule_create: '预约发布', schedule_cancel: '取消预约', schedule_run: '预约到点执行',
 };
 const RESPOND_STATE_LABEL = {
   missing: '待回应', invalid: '回应已失效', responded: '已回应', orphan: '回应草稿已不适用',
@@ -142,6 +143,7 @@ function render() {
       ? '<p class="muted">请在上方导入 UTF-8 逐字稿。</p>'
       : '<div class="empty">逐字稿尚未导入，请等待记录员导入并形成初始版本。</div>';
     $('#publish-bar').classList.add('hidden');
+    $('#schedule-banner').classList.add('hidden');
     $('#doc-title').textContent = '听证会逐字稿校订台';
     $('#ver-line').textContent = '尚无版本';
   } else {
@@ -150,6 +152,7 @@ function render() {
     $('#ver-line').textContent = `当前版本 v${booth.currentVersion.id} · ${booth.currentVersion.note} · ${booth.currentVersion.createdAt} UTC`;
     renderPaper();
     renderPublishBar();
+    renderScheduleBanner();
   }
   renderTabs();
   renderProposals();
@@ -906,7 +909,19 @@ async function withdrawResponse(id) {
 function renderVersions() {
   const panel = $('#panel-versions');
   if (!booth || !booth.initialized) { panel.innerHTML = '<div class="empty">尚无版本。</div>'; return; }
-  panel.innerHTML = booth.versions.map((v) => `
+  const sp = booth.schedule || { pending: null, recent: [] };
+  const schedHtml = `
+    <div class="ver-card" style="flex-direction:column;align-items:stretch;gap:8px">
+      <div class="vid">预约发布</div>
+      ${sp.pending
+        ? `<div><span class="tag tag-adopted">待执行 #${sp.pending.id}</span>
+             <div class="card-meta">${esc(sp.pending.wallTime)} ${esc(sp.pending.utcOffset)} · ${esc(sp.pending.createdBy)} · 基版 v${sp.pending.baseVersionId}</div>
+             ${me.role === 'reviewer' ? `<div class="card-actions"><button class="btn small danger" data-sch-cancel="${sp.pending.id}">取消预约</button></div>` : ''}
+           </div>`
+        : '<div class="muted">当前没有待执行预约。</div>'}
+      <button class="btn small" data-sch-panel>查看预约记录与未发布原因</button>
+    </div>`;
+  panel.innerHTML = schedHtml + booth.versions.map((v) => `
     <div class="ver-card">
       <div>
         <div class="vid">v${v.id} ${v.id === booth.currentVersion.id ? '<span class="tag tag-published">当前</span>' : ''}</div>
@@ -916,6 +931,10 @@ function renderVersions() {
     </div>`).join('');
   $$('#panel-versions [data-ver]').forEach((b) =>
     b.addEventListener('click', () => openVersion(parseInt(b.dataset.ver, 10))));
+  $$('#panel-versions [data-sch-panel]').forEach((b) =>
+    b.addEventListener('click', openSchedulePanel));
+  $$('#panel-versions [data-sch-cancel]').forEach((b) =>
+    b.addEventListener('click', () => cancelPendingSchedule()));
 }
 
 async function openVersion(id) {
@@ -986,10 +1005,23 @@ async function openVersion(id) {
 // ---------- 发布 ----------
 function renderPublishBar() {
   const bar = $('#publish-bar');
-  if (me.role !== 'reviewer' || !booth.stage.length) {
+  const pending = booth.schedule && booth.schedule.pending;
+  if (me.role !== 'reviewer') {
     bar.classList.add('hidden');
     return;
   }
+  // 复核员始终可见发布条：有暂存修订时显示发布/预约；暂存区为空但存在待执行预约时仅展示提示
+  const onlySchedule = !booth.stage.length && pending;
+  $('#publish-note').style.display = onlySchedule ? 'none' : '';
+  $('#publish-btn').style.display = onlySchedule ? 'none' : '';
+  bar.classList.toggle('hidden', !booth.stage.length && !pending);
+  if (onlySchedule) {
+    $('#stage-summary').innerHTML =
+      `<div class="publish-gate muted">当前暂存区为空（无可立即发布的修订）。待执行预约 #${pending.id} ` +
+      `到点重新核对时将按“暂存区为空”判定为预约失效。</div>`;
+  }
+  renderScheduleBox();
+  if (!booth.stage.length) return;
   bar.classList.remove('hidden');
   const segDesc = {};
   for (const p of booth.stage) {
@@ -1028,6 +1060,189 @@ $('#publish-btn').addEventListener('click', async () => {
     await reload();
   } catch (err) { toast(err.message, 'error'); await reload(); }
 });
+
+// ---------- 预约发布 ----------
+const SCHEDULE_STATUS_LABEL = {
+  pending: '待执行', executing: '执行中', published: '已执行', cancelled: '已取消', invalidated: '已失效',
+};
+
+function renderScheduleBox() {
+  const box = $('#schedule-box');
+  const pending = booth.schedule && booth.schedule.pending;
+  if (pending) {
+    box.innerHTML = `
+      <div class="schedule-form">
+        <span class="tag tag-adopted">已有待执行预约</span>
+        预约 #${pending.id}：${esc(pending.wallTime)} ${esc(pending.utcOffset)}
+        （UTC ${esc(pending.scheduledAtUTC)}）由 ${esc(pending.createdBy)} 创建；
+        到点将在同一事务重新核对预约快照，一致才发布，不一致则预约失效。
+      </div>`;
+    return;
+  }
+  box.innerHTML = `
+    <details class="schedule-form">
+      <summary>预约未来时间发布（可带 UTC 偏移）</summary>
+      <p class="muted" style="margin:6px 0">
+        预约时会立即按现有发布规则确认可发布（含被触及异议回应闸门），并固化当前版本、暂存采纳集合、
+        受影响异议与回应关联状态。到点重新核对一致才发布；其间任何一项变化都会使预约失效，须重新预约。
+      </p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <label>预约时间（所选偏移下的墙上时间）
+          <input type="datetime-local" id="sch-time" step="1" />
+        </label>
+        <label>UTC 偏移
+          <select id="sch-offset">
+            <option value="480">UTC+08:00（北京）</option>
+            <option value="0">UTC+00:00</option>
+            <option value="-300">UTC-05:00（美东）</option>
+            <option value="-480">UTC-08:00（美西）</option>
+            <option value="540">UTC+09:00（东京）</option>
+            <option value="60">UTC+01:00</option>
+            <option value="330">UTC+05:30（印度）</option>
+          </select>
+        </label>
+      </div>
+      <label style="display:block;margin-top:6px">版本说明（预约发布时使用）
+        <input id="sch-note" placeholder="如：预约在听证结束后24小时发布" />
+      </label>
+      <div class="card-actions">
+        <button class="btn small primary" id="sch-submit">确认预约</button>
+        <span class="muted" id="sch-preview"></span>
+      </div>
+      <p class="error-text" id="sch-msg"></p>
+    </details>`;
+
+  const now = new Date();
+  $('#sch-time').value = new Date(now.getTime() + 10 * 60000 - now.getTimezoneOffset() * 60000)
+    .toISOString().slice(0, 19);
+  const updatePreview = () => {
+    const t = $('#sch-time').value;
+    const off = parseInt($('#sch-offset').value, 10);
+    if (!t) { $('#sch-preview').textContent = ''; return; }
+    const epoch = Date.parse(t) - off * 60000;
+    $('#sch-preview').textContent = `= ${new Date(epoch).toISOString()}（绝对时刻）`;
+  };
+  $('#sch-time').addEventListener('input', updatePreview);
+  $('#sch-offset').addEventListener('change', updatePreview);
+  updatePreview();
+
+  $('#sch-submit').addEventListener('click', async () => {
+    const t = $('#sch-time').value;
+    const off = parseInt($('#sch-offset').value, 10);
+    if (!t) { $('#sch-msg').textContent = '请选择预约时间'; return; }
+    // 以“墙上时间 + 显式 UTC 偏移”提交，避免依赖浏览器本地时区
+    const scheduledAt = t.replace('T', 'T');
+    try {
+      const r = await api('/api/publish-schedules', {
+        method: 'POST',
+        body: { scheduledAt, utcOffsetMinutes: off, note: $('#sch-note').value },
+      });
+      toast(`预约 #${r.id} 已创建，将在 ${t} UTC${off >= 0 ? '+' : ''}${fmtOff(off)} 自动发布`, 'success');
+      await reload();
+    } catch (err) {
+      $('#sch-msg').textContent = err.message;
+      toast(err.message, 'error');
+    }
+  });
+}
+
+function fmtOff(min) {
+  const a = Math.abs(min);
+  return `${String(Math.floor(a / 60)).padStart(2, '0')}:${String(a % 60).padStart(2, '0')}`;
+}
+
+// 正文下方的预约状态条：任何登录用户可见；复核员可取消待执行预约；失效时展示未发布原因
+function renderScheduleBanner() {
+  const banner = $('#schedule-banner');
+  const panel = booth.schedule || { pending: null, recent: [] };
+  const pending = panel.pending;
+  const lastInvalid = !pending ? (panel.recent || []).find((x) => x.status === 'invalidated') : null;
+  if (!pending && !lastInvalid) {
+    banner.classList.add('hidden');
+    return;
+  }
+  banner.classList.remove('hidden');
+  if (pending) {
+    banner.className = 'schedule-banner pending';
+    banner.innerHTML = `
+      <div>
+        <span class="tag tag-adopted">预约待执行 #${pending.id}</span>
+        预约发布时间：<b>${esc(pending.wallTime)} ${esc(pending.utcOffset)}</b>
+        （绝对时刻 ${esc(pending.scheduledAtUTC)}）· 创建人：${esc(pending.createdBy)} · 创建于 ${esc(pending.createdAt)} UTC
+        · 基版 v${pending.baseVersionId} · 暂存修订 ${(pending.proposalIds || []).map((x) => `#${x}`).join('、')}
+        · 受影响异议 ${(pending.touchedObjectionIds || []).length} 条
+      </div>
+      <div class="card-actions">
+        ${me.role === 'reviewer' ? '<button class="btn small danger" id="sch-cancel">执行前取消预约</button>' : ''}
+        <button class="btn small" id="sch-detail">查看快照/最近记录</button>
+      </div>`;
+    const c = $('#sch-cancel');
+    if (c) c.addEventListener('click', cancelPendingSchedule);
+    $('#sch-detail').addEventListener('click', openSchedulePanel);
+  } else if (lastInvalid) {
+    banner.className = 'schedule-banner invalid';
+    banner.innerHTML = `
+      <div>
+        <span class="tag tag-conflicted">预约已失效 #${lastInvalid.id}</span>
+        原定时间 ${esc(lastInvalid.wallTime)} ${esc(lastInvalid.utcOffset)} · 创建人 ${esc(lastInvalid.createdBy)}
+        <div class="conflict-reason">未发布原因：${esc(lastInvalid.invalidReason || '预约快照与现有发布条件不一致')}</div>
+      </div>
+      <div class="card-actions"><button class="btn small" id="sch-detail">查看最近记录</button></div>`;
+    $('#sch-detail').addEventListener('click', openSchedulePanel);
+  }
+}
+
+async function cancelPendingSchedule() {
+  const pending = booth.schedule && booth.schedule.pending;
+  if (!pending) return;
+  const reason = prompt(`取消预约 #${pending.id} 的原因（可留空）：`) ?? null;
+  if (reason === null) return;
+  try {
+    await api(`/api/publish-schedules/${pending.id}/cancel`, { method: 'POST', body: { reason } });
+    toast(`预约 #${pending.id} 已取消`, 'success');
+    await reload();
+  } catch (err) { toast(err.message, 'error'); await reload(); }
+}
+
+function openSchedulePanel() {
+  tab = 'versions';
+  renderTabs();
+  const recent = (booth.schedule && booth.schedule.recent) || [];
+  openModal(`
+    <h3>预约发布记录</h3>
+    ${(booth.schedule && booth.schedule.pending) ? scheduleCardHtml(booth.schedule.pending) : '<p class="muted">当前没有待执行预约。</p>'}
+    <h4 style="margin-top:12px">最近记录</h4>
+    ${recent.length ? recent.map(scheduleCardHtml).join('') : '<p class="muted">暂无历史记录。</p>'}
+    <div class="actions"><button class="btn" data-close>关闭</button></div>`);
+}
+
+function scheduleCardHtml(s) {
+  const tag = s.status === 'published' ? 'tag-published' : s.status === 'invalidated' ? 'tag-conflicted'
+    : s.status === 'cancelled' ? 'tag-rejected' : 'tag-adopted';
+  return `
+    <div class="card">
+      <div class="card-head">
+        <span class="card-id">#${s.id} <span class="tag ${tag}">${SCHEDULE_STATUS_LABEL[s.status] || s.status}</span></span>
+        <span class="card-meta">${esc(s.wallTime)} ${esc(s.utcOffset)}</span>
+      </div>
+      <div class="card-meta">
+        创建人 ${esc(s.createdBy)} · 基版 v${s.baseVersionId} · 暂存修订 ${(s.proposalIds || []).map((x) => `#${x}`).join('、') || '（无）'}
+        ${s.publishedVersionId ? `· 已发布 v${s.publishedVersionId}` : ''}
+      </div>
+      ${s.note ? `<div class="basis"><b>版本说明：</b>${esc(s.note)}</div>` : ''}
+      ${s.invalidReason ? `<div class="conflict-reason">未发布原因：${esc(s.invalidReason)}</div>` : ''}
+      <div class="card-meta">
+        绝对时刻 ${esc(s.scheduledAtUTC)} · 创建于 ${esc(s.createdAt)} UTC
+        ${s.executedAt ? `· 执行于 ${esc(s.executedAt)} UTC` : ''}${s.cancelledAt ? `· 取消于 ${esc(s.cancelledAt)} UTC` : ''}
+      </div>
+    </div>`;
+}
+
+// 有待执行预约时自动刷新（到点后页面能及时反映发布/失效结果）
+setInterval(() => {
+  if (booth && booth.initialized && booth.schedule && booth.schedule.pending) reload();
+}, 4000);
+
 
 // ---------- 导入 ----------
 $('#import-file').addEventListener('change', (e) => {
