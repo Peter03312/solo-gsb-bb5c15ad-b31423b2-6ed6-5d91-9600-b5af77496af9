@@ -151,6 +151,7 @@ function render() {
     renderPaper();
     renderPublishBar();
   }
+  renderScheduleBox();
   renderTabs();
   renderProposals();
   renderObjections();
@@ -1011,6 +1012,11 @@ function renderPublishBar() {
     Object.entries(segDesc).map(([s, n]) => `第${s}段×${n}`).join('、') +
     `）。互不重叠的修订将合并发布为 v${booth.currentVersion.id + 1}` + gateHtml;
   $('#publish-btn').disabled = need > 0;
+  const scBtn = $('#schedule-open-btn');
+  if (scBtn) {
+    scBtn.disabled = need > 0 || !!booth.schedule;
+    scBtn.title = booth.schedule ? '已有待执行预约，请先取消' : (need > 0 ? '尚有被触及异议未完成回应' : '');
+  }
   const j = $('#gate-publish-jump');
   if (j) j.addEventListener('click', () => {
     tab = 'objections';
@@ -1028,6 +1034,120 @@ $('#publish-btn').addEventListener('click', async () => {
     await reload();
   } catch (err) { toast(err.message, 'error'); await reload(); }
 });
+
+// ---------- 预约发布 ----------
+const SCHEDULE_STATUS_CLS = { pending: 'sc-pending', published: 'sc-published', invalid: 'sc-invalid', cancelled: 'sc-cancelled' };
+
+function renderScheduleBox() {
+  const box = $('#schedule-box');
+  if (!booth || !booth.initialized || !box) return;
+  const pending = booth.schedule;
+  const recent = (booth.recentSchedules || []).filter((s) => s.status !== 'pending');
+  if (!pending && !recent.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+
+  const pendingHtml = pending ? `
+    <div class="sc-card ${SCHEDULE_STATUS_CLS.pending}">
+      <div class="sc-head">
+        <span class="tag tag-adopted">待执行预约 #${pending.id}</span>
+        <span class="card-meta">预约时间（UTC）：${esc(pending.scheduledAtUtc.slice(0, 19).replace('T', ' '))}</span>
+      </div>
+      <div class="card-meta">
+        本地时间：${new Date(pending.scheduledAtMs).toLocaleString()} · 原始输入：${esc(pending.scheduledAtInput)}<br/>
+        创建人：${esc(pending.createdBy)}（${esc(pending.createdByUser)}）· 创建于 ${esc(pending.createdAt)} UTC<br/>
+        预约基版 v${pending.baseVersionId} · 暂存提议 ${pending.stageProposalIds.map((x) => `#${x}`).join('、')}
+      </div>
+      <div class="basis"><b>版本说明：</b>${esc(pending.note)}</div>
+      <div class="snapshot-note">${esc(pending.notPublishedReason || '')}。到期将重新核对版本、暂存修订、受影响异议与回应关联；
+        一致才发布，任一变化将标记预约失效（不改版本、提议与决议，需重新预约）。</div>
+      ${me.role === 'reviewer' ? `<div class="card-actions">
+        <button class="btn small danger" id="sc-cancel">执行前取消预约</button></div>` : ''}
+    </div>` : '';
+
+  const recentHtml = recent.length ? `
+    <div class="sc-recent">
+      <span class="card-meta">近期预约记录：</span>
+      ${recent.map((s) => `
+        <span class="sc-chip ${SCHEDULE_STATUS_CLS[s.status] || ''}">
+          #${s.id} ${esc(s.statusLabel)}
+          · ${esc(s.scheduledAtUtc.slice(0, 19).replace('T', ' '))} UTC
+          ${s.publishedVersionId ? `→ v${s.publishedVersionId}` : ''}
+          ${s.notPublishedReason ? `· ${esc(s.notPublishedReason)}` : ''}
+        </span>`).join('')}
+    </div>` : '';
+
+  box.innerHTML = pendingHtml + recentHtml;
+
+  const cancelBtn = $('#sc-cancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => cancelSchedule(pending.id));
+}
+
+async function cancelSchedule(id) {
+  if (!window.confirm(`确定在执行前取消预约 #${id}？取消后可重新预约。`)) return;
+  try {
+    await api(`/api/schedules/${id}`, { method: 'DELETE' });
+    toast(`预约 #${id} 已取消`, 'success');
+    await reload();
+  } catch (err) { toast(err.message, 'error'); await reload(); }
+}
+
+// 生成“本地时区偏移”的 ISO 字符串（YYYY-MM-DDTHH:mm:ss±HH:mm）
+function localIso(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const offMin = -d.getTimezoneOffset();
+  const sign = offMin < 0 ? '-' : '+';
+  const off = `${sign}${pad(Math.floor(Math.abs(offMin) / 60))}:${pad(Math.abs(offMin) % 60)}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${off}`;
+}
+
+$('#schedule-open-btn')?.addEventListener('click', () => openScheduleModal());
+
+function openScheduleModal() {
+  const quick = (mins) => localIso(new Date(Date.now() + mins * 60000));
+  openModal(`
+    <h3>预约发布当前暂存修订</h3>
+    <p class="muted">预约时即按现有规则确认可发布（暂存区非空、被触及异议均已有效回应），
+      并记录当前版本、采纳提议内容与集合、受影响异议与有效回应的关联。
+      到期在同一事务中重新核对：一致才生成不可变新版本；关联已变化则预约失效，需重新预约。</p>
+    <label>发布时间（含 UTC 偏移，ISO 8601） <em style="color:var(--danger)">*</em>
+      <input id="sc-time" placeholder="2026-10-01T09:30:00+08:00 或 2026-10-01T01:30:00Z" />
+    </label>
+    <div class="card-actions">
+      <button class="btn small" data-quick="5">5 分钟后</button>
+      <button class="btn small" data-quick="60">1 小时后</button>
+      <button class="btn small" data-quick="1440">明天此时</button>
+    </div>
+    <label>版本说明 <em style="color:var(--danger)">*</em>
+      <textarea id="sc-note" rows="3" placeholder="如：按复核结论预约发布日期概括修订"></textarea>
+    </label>
+    <div class="actions">
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="sc-submit">确认预约</button>
+    </div>`);
+  $$('#modal-box [data-quick]').forEach((b) =>
+    b.addEventListener('click', () => { $('#sc-time').value = quick(parseInt(b.dataset.quick, 10)); }));
+  $('#sc-submit').addEventListener('click', async () => {
+    const scheduledAt = $('#sc-time').value.trim();
+    const note = $('#sc-note').value.trim();
+    if (!scheduledAt) { toast('请填写含 UTC 偏移的发布时间', 'error'); return; }
+    if (!note) { toast('版本说明不能为空', 'error'); return; }
+    try {
+      const r = await api('/api/schedules', { method: 'POST', body: { scheduledAt, note } });
+      closeModal();
+      toast(`预约 #${r.id} 已创建，将于 ${new Date(r.scheduledAtMs).toLocaleString()} 发布`, 'success');
+      await reload();
+    } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+// 有待执行预约时轮询刷新，使到期结果/失效状态及时呈现（弹窗打开时不打断操作）
+setInterval(async () => {
+  if (!booth || !booth.initialized || !booth.schedule) return;
+  if (!$('#modal-overlay').classList.contains('hidden') ||
+      !$('#version-overlay').classList.contains('hidden')) return;
+  try { await reload(); } catch (_) { /* ignore */ }
+}, 4000);
 
 // ---------- 导入 ----------
 $('#import-file').addEventListener('change', (e) => {

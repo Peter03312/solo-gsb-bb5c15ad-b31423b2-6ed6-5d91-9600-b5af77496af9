@@ -218,7 +218,40 @@ body {
   align-items: center;
 }
 .publish-bar > div:first-child { flex: 1; font-size: 13px; color: var(--primary-dark); }
-.publish-bar input { width: 240px; margin: 0; }
+.publish-bar input { width: 220px; margin: 0; }
+.publish-actions { display: flex; gap: 8px; align-items: center; }
+
+/* ---------- 预约发布 ---------- */
+.schedule-box {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sc-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--adopt-border);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.sc-card.sc-pending { border-left-color: #b8860b; background: #fffdf3; }
+.sc-card.sc-published { border-left-color: var(--adopt); }
+.sc-card.sc-invalid { border-left-color: var(--danger); background: #fff7f6; }
+.sc-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+.sc-recent { display: flex; flex-direction: column; gap: 6px; }
+.sc-chip {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 10px;
+}
+.sc-chip.sc-published { border-left: 3px solid var(--adopt); }
+.sc-chip.sc-invalid { border-left: 3px solid var(--danger); }
+.sc-chip.sc-cancelled { border-left: 3px solid var(--muted); }
 
 /* ---------- 侧栏标签 ---------- */
 .tabs { display: flex; border-bottom: 1px solid var(--line); }

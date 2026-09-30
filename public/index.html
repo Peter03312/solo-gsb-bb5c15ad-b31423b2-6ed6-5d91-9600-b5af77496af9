@@ -73,8 +73,14 @@
         <div id="publish-bar" class="publish-bar hidden">
           <div id="stage-summary"></div>
           <input id="publish-note" placeholder="版本说明（可选），如：第一次修订发布" />
-          <button class="btn primary" id="publish-btn">发布新版本</button>
+          <div class="publish-actions">
+            <button class="btn" id="schedule-open-btn">预约未来发布…</button>
+            <button class="btn primary" id="publish-btn">发布新版本</button>
+          </div>
         </div>
+
+        <!-- 预约发布状态（全部角色可见；复核员可取消/新建） -->
+        <div id="schedule-box" class="schedule-box hidden"></div>
       </section>
 
       <!-- 右：工作面板 -->

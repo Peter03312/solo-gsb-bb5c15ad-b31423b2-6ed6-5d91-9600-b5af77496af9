@@ -158,6 +158,32 @@ function initSchema(db) {
   CREATE UNIQUE INDEX IF NOT EXISTS idx_responses_one_draft
     ON objection_responses(objection_id) WHERE status = 'draft';
   CREATE INDEX IF NOT EXISTS idx_responses_published ON objection_responses(published_version_id);
+
+  -- 预约发布：复核员把当前暂存修订预约在未来时刻（含 UTC 偏移）自动发布。
+  -- 同一时刻至多一条 pending（创建时事务内保证）；到期事务内重核对快照：
+  -- 一致才生成不可变版本；版本/暂存/异议或回应关联变化 → 标记 invalid，不改版本、提议与决议。
+  CREATE TABLE IF NOT EXISTS publish_schedules (
+    id          INTEGER PRIMARY KEY,
+    scheduled_at_ms INTEGER NOT NULL,              -- 预约发布时刻（epoch 毫秒，UTC 绝对时刻）
+    scheduled_at_input TEXT NOT NULL,              -- 原始含偏移时间字符串（留痕展示）
+    note        TEXT NOT NULL,                     -- 本次版本说明
+    base_version_id INTEGER NOT NULL REFERENCES versions(id),  -- 预约时当前版本
+    stage_fingerprint TEXT NOT NULL DEFAULT '',    -- 预约时暂存区指纹
+    stage_snapshot_json TEXT NOT NULL DEFAULT '{}', -- 采纳提议集合与内容快照
+    touched_snapshot_json TEXT NOT NULL DEFAULT '[]', -- 受影响异议及其有效回应关联快照
+    status      TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','published','invalid','cancelled')),
+    invalid_reason TEXT NOT NULL DEFAULT '',
+    invalid_details_json TEXT NOT NULL DEFAULT '[]',
+    published_version_id INTEGER REFERENCES versions(id),
+    created_by  INTEGER NOT NULL REFERENCES users(id),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    fired_at_ms INTEGER,                           -- 实际执行（发布成功/标记失效）时刻
+    cancelled_at_ms INTEGER,
+    cancelled_by INTEGER REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_schedules_status_time
+    ON publish_schedules(status, scheduled_at_ms);
   `);
 
   // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别

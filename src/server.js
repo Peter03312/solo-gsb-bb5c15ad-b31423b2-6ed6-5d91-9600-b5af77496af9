@@ -4,6 +4,7 @@ const express = require('express');
 const { openDb, verifyPassword } = require('./db');
 const { currentUser, requireAuth, requireRole, createSession, destroySession } = require('./auth');
 const store = require('./store');
+const { startScheduler } = require('./scheduler');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -95,6 +96,24 @@ app.post('/api/publish', requireRole('reviewer'), wrap((req, res) => {
   res.status(201).json({ ok: true, versionId });
 }));
 
+// ---------- 预约发布（复核员） ----------
+// 列表：任何登录用户可读（页面展示预约时间、创建人、状态及未发布原因）
+app.get('/api/schedules', requireAuth, wrap((_req, res) => {
+  res.json({ pending: store.pendingSchedule(db), recent: store.listSchedules(db) });
+}));
+
+// 创建预约 {scheduledAt, note}：scheduledAt 须为含 UTC 偏移的 ISO 8601 未来时间（或 epoch 毫秒）
+app.post('/api/schedules', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.createSchedule(db, req.user, req.body || {});
+  res.status(201).json({ ok: true, id: result.id, scheduledAtMs: result.scheduledAtMs });
+}));
+
+// 取消待执行预约（执行前可取消）
+app.delete('/api/schedules/:id', requireRole('reviewer'), wrap((req, res) => {
+  const id = store.cancelSchedule(db, req.user, parseInt(req.params.id, 10));
+  res.json({ ok: true, id });
+}));
+
 // ---------- 异议（全部登录用户可提出；重新定位限提出者/复核员，在 store 内校验） ----------
 app.post('/api/objections', requireAuth, wrap((req, res) => {
   const id = store.createObjection(db, req.user, req.body || {});
@@ -145,4 +164,6 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, HOST, () => {
   console.log(`听证会校订台已启动：http://localhost:${PORT}`);
+  // 预约发布：重启后继续处理未到时预约，并立即核查已逾期预约
+  startScheduler(db);
 });
